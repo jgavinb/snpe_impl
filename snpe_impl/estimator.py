@@ -1,45 +1,54 @@
 import numpy as np
 from scipy.spatial import KDTree
+from scipy.special import comb  # For large n, but we use recursive weights
 
 
 class BaggedNN:
-    """Bagged Nearest Neighbors estimator for conditional expectations."""
+    """Bagged Nearest Neighbors with L-representation, jackknife, and bootstrap support."""
 
-    def __init__(self, m=7, num_bags=50, bag_fraction=0.5):
+    def __init__(self, m=7, jackknife=False, d=None, m_ratio=2.0):
         self.m = m
-        self.num_bags = num_bags
-        self.bag_fraction = bag_fraction
-        self.trees = []
-        self.y_bags = []
+        self.jackknife = jackknife
+        self.d = d  # Dim for jackknife alpha = -2/d
+        self.m2 = int(m * m_ratio) if jackknife else None
         self.X_mean = None
         self.X_std = None
 
     def fit(self, X, y):
-        """Fit on data X (features), y (target scalar)."""
+        """Fit normalizer; no tree needed for L-rep."""
         self.X_mean = np.mean(X, axis=0)
         self.X_std = np.std(X, axis=0) + 1e-6
-        X_norm = (X - self.X_mean) / self.X_std
-        n = X.shape[0]
-        bag_size = int(self.bag_fraction * n)
-        for _ in range(self.num_bags):
-            idx = np.random.choice(n, bag_size, replace=False)
-            tree = KDTree(X_norm[idx])
-            self.trees.append(tree)
-            self.y_bags.append(y[idx])
+        self.X_norm = (X - self.X_mean) / self.X_std
+        self.y = y
+        self.n = len(y)
         return self
 
-    def predict(self, X_test, jackknife_bias=True):
-        """Predict conditional expectation at X_test."""
+    def _compute_tau(self, X_test_norm, m):
+        """Compute bagged NN via L-rep for scale m."""
+        preds = np.zeros(X_test_norm.shape[0])
+        for i, x0 in enumerate(X_test_norm):
+            dists = np.linalg.norm(self.X_norm - x0, axis=1)
+            indices = np.argsort(dists)
+            sorted_y = self.y[indices]
+            # Recursive weights to avoid overflow
+            weights = np.zeros(self.n)
+            weights[0] = m / self.n
+            for k in range(1, self.n):
+                weights[k] = weights[k - 1] * (self.n - m - k + 1) / (self.n - k + 1)
+                if weights[k] <= 0:
+                    break
+            weights /= np.sum(weights)  # Normalize if needed, but should sum to 1
+            preds[i] = np.dot(weights, sorted_y)
+        return preds
+
+    def predict(self, X_test):
+        """Predict with optional jackknife bias reduction."""
         X_test_norm = (X_test - self.X_mean) / self.X_std
-        preds = np.zeros((X_test.shape[0], self.num_bags))
-        for b in range(self.num_bags):
-            dists, idxs = self.trees[b].query(X_test_norm, k=self.m)
-            neighbor_ys = self.y_bags[b][idxs]
-            bag_pred = np.mean(neighbor_ys, axis=1)
-            if jackknife_bias:
-                # Jackknife bias reduction: avg leave-one-out on neighbors
-                loo_avgs = (np.sum(neighbor_ys, axis=1) - neighbor_ys.T) / (self.m - 1)
-                loo_avg = np.mean(loo_avgs, axis=0)
-                bag_pred = self.m * bag_pred - (self.m - 1) * loo_avg
-            preds[:, b] = bag_pred
-        return np.mean(preds, axis=1)
+        tau_m = self._compute_tau(X_test_norm, self.m)
+        if not self.jackknife or self.d is None:
+            return tau_m
+        tau_m2 = self._compute_tau(X_test_norm, self.m2)
+        alpha = -2.0 / self.d
+        theta1 = self.m**alpha / (self.m**alpha - self.m2**alpha)
+        theta2 = -(self.m2**alpha) / (self.m**alpha - self.m2**alpha)
+        return theta1 * tau_m + theta2 * tau_m2
